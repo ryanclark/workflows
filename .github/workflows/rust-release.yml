@@ -1,0 +1,245 @@
+name: rust-release
+
+on:
+  workflow_call:
+    inputs:
+      bin-name:
+        description: Cargo binary name (also the formula filename).
+        type: string
+        required: true
+      formula-class:
+        description: Homebrew formula Ruby class name (e.g. Statusline).
+        type: string
+        required: true
+      formula-desc:
+        description: Homebrew formula description.
+        type: string
+        required: true
+      targets:
+        description: JSON array of {target, os, codesign} build entries.
+        type: string
+        required: true
+      build-features:
+        description: Cargo features applied to codesigned builds only (e.g. codesigned).
+        type: string
+        default: ""
+      tap-repo:
+        description: Homebrew tap repository name (under the same owner).
+        type: string
+        default: homebrew-tap
+      tap-app-id:
+        description: GitHub App ID used to mint the tap-publishing token.
+        type: string
+        default: "3903999"
+    secrets:
+      APPLE_CERTIFICATE_P12:
+        required: false
+      APPLE_CERTIFICATE_PASSWORD:
+        required: false
+      APPLE_SIGNING_IDENTITY:
+        required: false
+      TAP_APP_KEY:
+        description: PEM private key for the tap-publishing GitHub App.
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.targets) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: actions/cache/restore@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-release-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-release-${{ matrix.target }}-
+
+      - name: Build (signed targets)
+        if: ${{ matrix.codesign }}
+        run: cargo build --locked --release --target ${{ matrix.target }} ${{ inputs.build-features != '' && format('--features {0}', inputs.build-features) || '' }}
+
+      - name: Build (unsigned targets)
+        if: ${{ !matrix.codesign }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Save cache
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-release-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Codesign
+        if: ${{ matrix.codesign }}
+        env:
+          CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          KEYCHAIN="build.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
+
+          echo "$CERTIFICATE_P12" | base64 -d > certificate.p12
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import certificate.p12 -k "$KEYCHAIN" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+
+          codesign --force --options runtime --sign "$IDENTITY" "target/${{ matrix.target }}/release/${{ inputs.bin-name }}"
+          codesign --verify --verbose "target/${{ matrix.target }}/release/${{ inputs.bin-name }}"
+
+      - name: Package
+        run: tar czf "${{ inputs.bin-name }}-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" "${{ inputs.bin-name }}"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release upload "${{ github.ref_name }}" "${{ inputs.bin-name }}-${{ matrix.target }}.tar.gz"
+
+      - name: Cleanup signing artifacts
+        if: ${{ always() && matrix.codesign }}
+        run: |
+          rm -f certificate.p12
+          security delete-keychain build.keychain-db 2>/dev/null || true
+
+  tap:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern '${{ inputs.bin-name }}-*.tar.gz' \
+            --dir dist
+
+      - uses: actions/create-github-app-token@v1
+        id: tap-token
+        with:
+          app-id: ${{ inputs.tap-app-id }}
+          private-key: ${{ secrets.TAP_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ inputs.tap-repo }}
+
+      - name: Update Homebrew tap
+        env:
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
+          BIN: ${{ inputs.bin-name }}
+          FORMULA_CLASS: ${{ inputs.formula-class }}
+          FORMULA_DESC: ${{ inputs.formula-desc }}
+          TAP_REPO_NAME: ${{ inputs.tap-repo }}
+          GEN_FORMULA: |
+            import glob, hashlib, os, sys
+
+            version, repo, base = sys.argv[1], sys.argv[2], sys.argv[3]
+            bin_name = os.environ["BIN"]
+            cls = os.environ["FORMULA_CLASS"]
+            desc = os.environ["FORMULA_DESC"]
+
+            def rb(s):
+                # escape backslashes and double-quotes for a Ruby string literal
+                return s.replace("\\", "\\\\").replace('"', '\\"')
+
+            def sha256(path):
+                h = hashlib.sha256()
+                with open(path, "rb") as f:
+                    for chunk in iter(lambda: f.read(8192), b""):
+                        h.update(chunk)
+                return h.hexdigest()
+
+            # platform -> arch -> (url, sha256)
+            blocks = {"macos": {}, "linux": {}}
+            for path in sorted(glob.glob(f"dist/{bin_name}-*.tar.gz")):
+                fname = os.path.basename(path)
+                triple = fname[len(bin_name) + 1 : -len(".tar.gz")]
+                if "apple-darwin" in triple:
+                    platform = "macos"
+                elif "linux" in triple:
+                    platform = "linux"
+                else:
+                    sys.exit(f"unknown OS in target: {triple}")
+                if triple.startswith(("aarch64", "arm64")):
+                    arch = "arm"
+                elif triple.startswith("x86_64"):
+                    arch = "intel"
+                else:
+                    sys.exit(f"unknown arch in target: {triple}")
+                blocks[platform][arch] = (f"{base}/{fname}", sha256(path))
+
+            if not any(blocks.values()):
+                sys.exit("no release tarballs found in dist/")
+
+            out = [
+                f"class {cls} < Formula",
+                f'  desc "{rb(desc)}"',
+                f'  homepage "https://github.com/{repo}"',
+                f'  version "{version}"',
+                '  license "MIT"',
+                "",
+            ]
+            for platform in ("macos", "linux"):
+                if not blocks[platform]:
+                    continue
+                out.append(f"  on_{platform} do")
+                for arch in ("arm", "intel"):
+                    if arch in blocks[platform]:
+                        url, sha = blocks[platform][arch]
+                        out += [
+                            f"    on_{arch} do",
+                            f'      url "{url}"',
+                            f'      sha256 "{sha}"',
+                            "    end",
+                        ]
+                out += ["  end", ""]
+            out += ["  def install", f'    bin.install "{bin_name}"', "  end", "end"]
+            print("\n".join(out))
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          REPO="${GITHUB_REPOSITORY}"
+          TAG="${GITHUB_REF_NAME}"
+          BASE="https://github.com/${REPO}/releases/download/${TAG}"
+
+          python3 -c "$GEN_FORMULA" "$VERSION" "$REPO" "$BASE" > formula.rb
+          echo "--- generated formula ---"
+          cat formula.rb
+
+          TAP_REPO="${GITHUB_REPOSITORY_OWNER}/${TAP_REPO_NAME}"
+          FORMULA_PATH="Formula/${BIN}.rb"
+          EXISTING_SHA=$(gh api "repos/${TAP_REPO}/contents/${FORMULA_PATH}" --jq .sha 2>/dev/null || echo "")
+
+          ARGS=(
+            --method PUT
+            --field "message=${BIN} ${VERSION}"
+            --field "content=$(base64 -w0 formula.rb)"
+          )
+          if [ -n "$EXISTING_SHA" ]; then
+            ARGS+=(--field "sha=${EXISTING_SHA}")
+          fi
+
+          gh api "repos/${TAP_REPO}/contents/${FORMULA_PATH}" "${ARGS[@]}"
