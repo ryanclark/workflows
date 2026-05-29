@@ -15,6 +15,10 @@ on:
         description: Also run clippy with the `codesigned` feature.
         type: boolean
         default: false
+      cargo-deny:
+        description: Run cargo-deny supply-chain/license checks (needs a deny.toml).
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -64,3 +68,13 @@ jobs:
             ~/.cargo/git
             target
           key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+  deny:
+    if: ${{ inputs.cargo-deny }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
