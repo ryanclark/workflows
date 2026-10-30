@@ -195,21 +195,37 @@ jobs:
             if not any(blocks.values()):
                 sys.exit("no release tarballs found in dist/")
 
+            arch_tag = {"arm": ":arm64", "intel": ":x86_64"}
+            default = next(
+                (platform, arch)
+                for platform, arch in (("macos", "arm"), ("macos", "intel"), ("linux", "intel"), ("linux", "arm"))
+                if arch in blocks[platform]
+            )
+            default_url, default_sha = blocks[default[0]][default[1]]
+
             out = [
                 f"class {cls} < Formula",
                 f'  desc "{rb(desc)}"',
                 f'  homepage "https://github.com/{repo}"',
+                f'  url "{default_url}"',
                 f'  version "{version}"',
+                f'  sha256 "{default_sha}"',
                 '  license "MIT"',
                 "",
             ]
+            missing = [platform for platform in ("macos", "linux") if not blocks[platform]]
+            if missing:
+                out += [f"  depends_on :{'linux' if missing[0] == 'macos' else 'macos'}", ""]
             for platform in ("macos", "linux"):
-                if not blocks[platform]:
+                builds = blocks[platform]
+                if not builds:
                     continue
                 out.append(f"  on_{platform} do")
+                if len(builds) == 1:
+                    out.append(f"    depends_on arch: {arch_tag[next(iter(builds))]}")
                 for arch in ("arm", "intel"):
-                    if arch in blocks[platform]:
-                        url, sha = blocks[platform][arch]
+                    if arch in builds and (platform, arch) != default:
+                        url, sha = builds[arch]
                         out += [
                             f"    on_{arch} do",
                             f'      url "{url}"',
